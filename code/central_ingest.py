@@ -205,3 +205,192 @@ def process_batch(conn, batch_data: dict, bytes_received: int) -> tuple[int, int
     
     conn.commit()
     return accepted, rejected, duplicate
+
+def create_rabbitmq_connection(host: str, port: int, username: str, password: str) -> Optional[pika.BlockingConnection]:
+    """Create RabbitMQ connection."""
+    credentials = pika.PlainCredentials(username, password)
+    parameters = pika.ConnectionParameters(
+        host=host,
+        port=port,
+        credentials=credentials,
+        heartbeat=600,
+        blocked_connection_timeout=300,
+        connection_attempts=3,
+        retry_delay=2
+    )
+    try:
+        connection = pika.BlockingConnection(parameters)
+        return connection
+    except Exception as e:
+        logger.error(f"Failed to connect to RabbitMQ: {e}")
+        return None
+
+def consume_loop(conn, rabbitmq_config: dict, stop_event):
+    """Main consumption loop."""
+    rabbit_conn = None
+    channel = None
+    
+    while not stop_event.is_set():
+        # Ensure connection
+        if rabbit_conn is None or rabbit_conn.is_closed:
+            rabbit_conn = create_rabbitmq_connection(
+                rabbitmq_config['host'],
+                rabbitmq_config['port'],
+                rabbitmq_config['username'],
+                rabbitmq_config['password']
+            )
+            if rabbit_conn is None:
+                time.sleep(5)
+                continue
+            
+            try:
+                channel = rabbit_conn.channel()
+                # Set QoS to process one message at a time (for fairness)
+                channel.basic_qos(prefetch_count=1)
+                
+                # Declare queue (in case it doesn't exist)
+                channel.queue_declare(
+                    queue=rabbitmq_config['queue'],
+                    durable=True
+                )
+                
+                # Purge queue if requested (for clean test runs)
+                if rabbitmq_config.get('purge_on_start', False):
+                    purged = channel.queue_purge(queue=rabbitmq_config['queue'])
+                    logger.info(f"Purged {purged} messages from queue")
+                
+                logger.info("Connected to RabbitMQ and ready to consume")
+            except Exception as e:
+                logger.error(f"Failed to setup RabbitMQ channel: {e}")
+                rabbit_conn.close()
+                rabbit_conn = None
+                time.sleep(5)
+                continue
+        
+        # Consume messages
+        try:
+            method_frame, header_frame, body = channel.basic_get(
+                queue=rabbitmq_config['queue'],
+                auto_ack=False
+            )
+            
+            if method_frame is None:
+                # No message available
+                time.sleep(0.1)
+                continue
+            
+            # Process message
+            try:
+                batch_data = decompress_batch(body)
+                accepted, rejected, duplicate = process_batch(conn, batch_data, len(body))
+                
+                metrics.inc_accepted(accepted)
+                metrics.inc_rejected(rejected)
+                metrics.inc_duplicate(duplicate)
+                
+                # Acknowledge message
+                channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                
+                logger.debug(
+                    f"Processed batch: accepted={accepted}, rejected={rejected}, "
+                    f"duplicate={duplicate}"
+                )
+                
+            except Exception as e:
+                logger.error(f"Failed to process message: {e}")
+                # Reject and requeue (will retry)
+                channel.basic_nack(
+                    delivery_tag=method_frame.delivery_tag,
+                    requeue=True
+                )
+        
+        except pika.exceptions.AMQPConnectionError:
+            logger.warning("Connection lost, reconnecting...")
+            try:
+                if channel:
+                    channel.close()
+                if rabbit_conn:
+                    rabbit_conn.close()
+            except:
+                pass
+            rabbit_conn = None
+            channel = None
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Unexpected error in consume loop: {e}")
+            time.sleep(1)
+    
+    # Cleanup
+    try:
+        if channel:
+            channel.close()
+        if rabbit_conn:
+            rabbit_conn.close()
+    except:
+        pass
+
+def metrics_logger_loop(stop_event):
+    """Periodically log metrics."""
+    while not stop_event.is_set():
+        time.sleep(10)  # Log every 10 seconds
+        metrics.log_stats()
+
+def main():
+    import argparse
+    
+    ap = argparse.ArgumentParser(description="Central ingest service with RabbitMQ Pub/Sub")
+    ap.add_argument("--db", default="telemetry.sqlite", help="SQLite database path")
+    ap.add_argument("--rabbitmq-host", default="localhost", help="RabbitMQ host")
+    ap.add_argument("--rabbitmq-port", type=int, default=5672, help="RabbitMQ port")
+    ap.add_argument("--rabbitmq-username", default="guest", help="RabbitMQ username")
+    ap.add_argument("--rabbitmq-password", default="guest", help="RabbitMQ password")
+    ap.add_argument("--rabbitmq-queue", default="telemetry_queue", help="RabbitMQ queue name")
+    ap.add_argument("--purge-queue", action="store_true", help="Purge queue on startup (for clean test runs)")
+    args = ap.parse_args()
+    
+    global DB
+    DB = args.db
+    
+    logger.info("Starting central ingest service...")
+    logger.info(f"Database: {DB}")
+    logger.info(f"RabbitMQ: {args.rabbitmq_host}:{args.rabbitmq_port}")
+    
+    conn = open_db()
+    stop_event = Event()
+    
+    rabbitmq_config = {
+        'host': args.rabbitmq_host,
+        'port': args.rabbitmq_port,
+        'username': args.rabbitmq_username,
+        'password': args.rabbitmq_password,
+        'queue': args.rabbitmq_queue,
+        'purge_on_start': args.purge_queue
+    }
+    
+    # Handle graceful shutdown
+    def signal_handler(sig, frame):
+        logger.info("Received shutdown signal, stopping...")
+        stop_event.set()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Start metrics logger
+    metrics_thread = threading.Thread(target=metrics_logger_loop, args=(stop_event,), daemon=True)
+    metrics_thread.start()
+    
+    # Start consuming
+    try:
+        consume_loop(conn, rabbitmq_config, stop_event)
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal")
+    finally:
+        stop_event.set()
+        logger.info("Waiting for threads to finish...")
+        metrics_thread.join(timeout=2)
+        conn.close()
+        metrics.log_stats()
+        logger.info("Central ingest service stopped")
+
+if __name__ == "__main__":
+    main()
