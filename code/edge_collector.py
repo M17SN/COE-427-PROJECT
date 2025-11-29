@@ -461,3 +461,136 @@ def publish_loop(conn, rabbitmq_config: dict, batch_size: int, stop: Event, batc
             rabbit_conn.close()
     except:
         pass
+
+def metrics_logger_loop(stop: Event):
+    """Periodically log metrics."""
+    while not stop.is_set():
+        time.sleep(10)  # Log every 10 seconds
+        metrics.log_stats()
+
+def main():
+    ap = argparse.ArgumentParser(description="Edge collector with RabbitMQ Pub/Sub")
+    ap.add_argument("--db", default="edge_spool.sqlite", help="SQLite spool database path")
+    ap.add_argument("--rabbitmq-host", default="localhost", help="RabbitMQ host")
+    ap.add_argument("--rabbitmq-port", type=int, default=5672, help="RabbitMQ port")
+    ap.add_argument("--rabbitmq-username", default="guest", help="RabbitMQ username")
+    ap.add_argument("--rabbitmq-password", default="guest", help="RabbitMQ password")
+    ap.add_argument("--rabbitmq-exchange", default="telemetry", help="RabbitMQ exchange name")
+    ap.add_argument("--rabbitmq-queue", default="telemetry_queue", help="RabbitMQ queue name")
+    ap.add_argument("--rabbitmq-routing-key", default="telemetry", help="RabbitMQ routing key")
+    ap.add_argument("--batch-size", type=int, default=50, help="Batch size for publishing")
+    ap.add_argument("--batch-timeout", type=float, default=1.0, help="Max seconds to wait before publishing partial batch (default 1.0s)")
+    args = ap.parse_args()
+    
+    logger.info("Starting edge collector...")
+    logger.info(f"RabbitMQ: {args.rabbitmq_host}:{args.rabbitmq_port}")
+    logger.info(f"Batch size: {args.batch_size}")
+    
+    conn = open_db(Path(args.db))
+    stop = Event()
+    
+    rabbitmq_config = {
+        'host': args.rabbitmq_host,
+        'port': args.rabbitmq_port,
+        'username': args.rabbitmq_username,
+        'password': args.rabbitmq_password,
+        'exchange': args.rabbitmq_exchange,
+        'queue': args.rabbitmq_queue,
+        'routing_key': args.rabbitmq_routing_key
+    }
+    
+    # Create separate connection for publisher thread (SQLite connections are not thread-safe)
+    publisher_conn = open_db(Path(args.db))
+    
+    # Start publisher thread
+    publisher_thread = Thread(
+        target=publish_loop,
+        args=(publisher_conn, rabbitmq_config, args.batch_size, stop, args.batch_timeout),
+        daemon=True
+    )
+    publisher_thread.start()
+    
+    # Start metrics logger thread
+    metrics_thread = Thread(target=metrics_logger_loop, args=(stop,), daemon=True)
+    metrics_thread.start()
+    
+    # Read emulator JSONL from stdin and enqueue each record immediately
+    logger.info("Reading from stdin...")
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                enqueue(conn, rec)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON line: {line[:100]}")
+            except Exception as e:
+                logger.error(f"Error processing line: {e}")
+    except KeyboardInterrupt:
+        logger.info("Received interrupt signal, shutting down...")
+    finally:
+        logger.info("Stdin closed, waiting for all records to be published...")
+        # Wait for all records to be published BEFORE setting stop event
+        # (Don't set stop yet - let publisher continue)
+        import time as time_module
+        max_wait = 60  # Wait up to 60 seconds
+        waited = 0
+        last_unsent = None
+        stable_count = 0
+        
+        while waited < max_wait:
+            cur = conn.execute("SELECT COUNT(*) FROM spool WHERE sent=0")
+            unsent = cur.fetchone()[0]
+            
+            if unsent == 0:
+                # Double-check: wait a moment to ensure no race condition
+                time_module.sleep(0.5)
+                cur = conn.execute("SELECT COUNT(*) FROM spool WHERE sent=0")
+                unsent = cur.fetchone()[0]
+                if unsent == 0:
+                    logger.info("All records published, shutting down...")
+                    break
+            
+            # Check if count is stable (not changing)
+            if unsent == last_unsent:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_unsent = unsent
+            
+            # If count hasn't changed for 3 seconds, might be stuck (but don't exit - keep waiting)
+            if stable_count >= 3 and unsent > 0:
+                logger.warning(f"Unsent count stable at {unsent} for 3s - publisher may be stuck or RabbitMQ may be down, continuing to wait...")
+            
+            if waited % 2 == 0:  # Log every 2 seconds
+                logger.info(f"Waiting for {unsent} unsent records to be published... (waited {waited}s)")
+            
+            time_module.sleep(1)
+            waited += 1
+        
+        # Final check
+        cur = conn.execute("SELECT COUNT(*) FROM spool WHERE sent=0")
+        final_unsent = cur.fetchone()[0]
+        
+        if final_unsent > 0:
+            logger.warning(f"Warning: {final_unsent} records still unsent after waiting {max_wait}s")
+            logger.warning("This may be due to RabbitMQ being down - records are buffered locally and will be sent when RabbitMQ is available")
+            logger.warning("Setting stop event, but publisher thread will continue trying to publish remaining records...")
+        else:
+            logger.info("All records successfully published!")
+        
+        # NOW set stop event to signal publisher thread to exit
+        # But the publisher thread will only exit if stop is set AND no more records
+        stop.set()
+        logger.info("Waiting for publisher thread to finish...")
+        publisher_thread.join(timeout=15)  # Give more time for final cleanup
+        metrics_thread.join(timeout=2)
+        conn.close()
+        publisher_conn.close()
+        metrics.log_stats()
+        logger.info("Edge collector stopped")
+
+if __name__ == "__main__":
+    main()
